@@ -268,8 +268,13 @@ fn callable() -> Vec<if_addrs::Interface> {
 /// Waits for the caller's first signalling packet and returns where it came from; replying there gets through NAT.
 /// `nonce` is the one the call will start with, so a HELLO sent from here is not a stale nonce later.
 fn answer(sock: &UdpSocket, nonce: u64) -> SocketAddr {
-    let on: String = callable().iter().map(|i| format!("{} ({}), ", i.ip(), i.name)).collect();
-    eprintln!("v2v: awaiting a call on {on}UDP port {PORT} (Ctrl-C to cancel)...");
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let c = |code: &str, t: &str| if color { format!("\x1b[{code}m{t}\x1b[0m") } else { t.to_string() };
+    let mut s = format!("{}\n", c("1;33", &format!("v2v listening on UDP port {PORT}:")));
+    for i in callable() {
+        s += &format!("  {} {}\n", c("32", &format!("{:<15}", i.ip())), c("2", &format!("({})", i.name)));
+    }
+    eprintln!("{s}{}", c("2", "waiting for a call, Ctrl-C to cancel..."));
     let mut buf = [0u8; 2048];
     let (hello, mut last) = (signal::hello(nonce), None::<Instant>);
     loop {
