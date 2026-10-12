@@ -313,8 +313,8 @@ pub fn camera_loop(sh: Arc<Shared>, net: Option<SyncSender<Encoded>>, selfv: Sel
             }
         };
         fails = 0;
-        // cap the rate: the encoder's rate control assumes at most FPS
-        if last.elapsed() < Duration::from_millis(1000 / FPS as u64 - 3) {
+        // cap the rate: the encoder's rate control assumes at most FPS; the wide margin keeps a jittery FPS camera at full rate
+        if last.elapsed() < Duration::from_millis(1000 / FPS as u64 * 2 / 3) {
             continue;
         }
         last = Instant::now();
@@ -351,6 +351,34 @@ mod tests {
         let px = |v: Vec<u32>| v.into_iter().map(|p| p >> 16).collect::<Vec<_>>();
         assert_eq!(px(to_argb(&img, false)), [1, 2, 3, 4, 5, 6]);
         assert_eq!(px(to_argb(&img, true)), [3, 2, 1, 6, 5, 4]);
+    }
+
+    #[test]
+    fn h264_resizes_with_bitrate() {
+        let sh = crate::Shared::new(Default::default(), false);
+        let (mut h264, mut dec) = (H264::default(), Decoder::new().unwrap());
+        let mut sizes = Vec::new();
+        let mut at = sh.start;
+        for (i, bps) in [2_000_000, 1_000_000, 500_000, 200_000, 1_500_000].into_iter().enumerate() {
+            sh.stats.video_bps.store(bps, Relaxed);
+            for f in 0..10 {
+                // synthetic moving gradient, not a camera frame
+                let img = RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x + f * 8) as u8, y as u8, (i * 50) as u8]));
+                at += Duration::from_millis(33);
+                let au = h264.encode(&sh, &img, at).unwrap();
+                if au.is_empty() {
+                    continue;
+                }
+                if let Some(yuv) = dec.decode(&au).unwrap_or_else(|e| panic!("{bps} frame {f}: {e}")) {
+                    let d = yuv.dimensions();
+                    if sizes.last().is_none_or(|l| *l != d) {
+                        sizes.push(d);
+                    }
+                }
+            }
+        }
+        // 500k stays full size: the switch down is at 400k, and back up only above 600k
+        assert_eq!(sizes, [(640, 480), (320, 240), (640, 480)]);
     }
 
     #[test]

@@ -221,7 +221,9 @@ pub fn run(sh: Arc<Shared>, title: String) -> std::io::Result<()> {
         }
         let rows: Vec<Line> = ui.items.iter().map(|&it| ui.row(it, &s)).collect();
         let rms = f32::from_bits(sh.mic_level.load(Relaxed));
-        let lvl = ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0) as f64; // -60..0 dBFS
+        // max/min, not clamp: NaN becomes 0 (Gauge::ratio panics outside 0..=1)
+        #[allow(clippy::manual_clamp)]
+        let lvl = ((20.0 * rms.log10() + 60.0) / 60.0).max(0.0).min(1.0) as f64; // -60..0 dBFS
         let status = sh.status.lock().unwrap().clone();
         *state.offset_mut() = 0; // re-scroll from the top each frame, so growing the terminal shows every row again
         term.draw(|f| {

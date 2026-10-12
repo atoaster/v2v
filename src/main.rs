@@ -113,7 +113,7 @@ fn help(color: bool) -> String {
          {} in the menu, Esc in the window or closing it hangs up ({} in --tplay).\n\
          {} opens the same menu without calling, with a camera preview window, to test\n\
          devices before a call. Settings are saved to {} and used by every mode\n\
-         (--tplay and --audio start unmuted, with video on).\n\n\
+         (calls without the menu, i.e. --tplay, --audio or no terminal, start unmuted with video on).\n\n\
          {}\n",
         c("1;36", "v2v"),
         head("usage:"),
@@ -129,9 +129,8 @@ fn help(color: bool) -> String {
         head("The other side responds with one of:"),
     );
     let ifs = if_addrs::get_if_addrs().unwrap_or_default();
-    // link-local v6 would need a %scope suffix that differs per peer, so skip it
-    for i in ifs.iter().filter(|i| !i.is_loopback() && !i.is_link_local()) {
-        s += &format!("  v2v {} {}\n", cmd(&format!("{:<39}", i.ip())), dim(&format!("# {}", i.name)));
+    for i in ifs.iter().filter(|i| i.ip().is_ipv4() && !i.is_loopback() && !i.is_link_local()) {
+        s += &format!("  v2v {} {}\n", cmd(&format!("{:<15}", i.ip())), dim(&format!("# {}", i.name)));
     }
     s + &format!(
         "\n{}\n  {}  render the video in the terminal via tplay instead of a window\n  \
@@ -145,6 +144,9 @@ fn help(color: bool) -> String {
 }
 
 fn main() {
+    // minifb's XOpenIM segfaults if XMODIFIERS names an input method not running on this display
+    // (ssh -X, nested X); the window takes no text input. Safe: no other thread exists yet.
+    unsafe { std::env::set_var("XMODIFIERS", "@im=none") };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         let out = std::io::stdout();
@@ -230,16 +232,21 @@ fn main() {
         }
         thread::spawn(move || audio::loopback(pcm_rx, player));
     }
-    match mode {
-        Mode::Tplay => tplay::run_tplay(frame, peer, &sh.quit),
-        Mode::Audio => {
-            if let Err(e) = viz::run_audio(peer, tap, &sh.mic_level, &sh.quit) {
+    // errors still fall through to the hang-up below, so the peer gets its BYE
+    let code = match mode {
+        Mode::Tplay => tplay::run_tplay(frame, peer, &sh.quit).unwrap_or_else(|e| {
+            eprintln!("v2v: {e}");
+            1
+        }),
+        Mode::Audio => viz::run_audio(peer, tap, &sh.mic_level, &sh.quit).map_or_else(
+            |e| {
                 eprintln!("v2v: terminal error: {e}");
-                std::process::exit(1);
-            }
-        }
+                1
+            },
+            |_| 0,
+        ),
         Mode::Window => run_window(sh.clone(), frame, selfv, peer, tty),
-    }
+    };
     sh.quit.store(true, Relaxed);
     // the network thread sends the BYE on its way out (within a few ms)
     if let Some(net) = net {
@@ -247,6 +254,9 @@ fn main() {
     }
     if sh.peer_bye.load(Relaxed) {
         eprintln!("v2v: the other side hung up");
+    }
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
@@ -258,7 +268,8 @@ fn answer(sock: &UdpSocket, nonce: u64) -> SocketAddr {
     let (hello, mut last) = (signal::hello(nonce), None::<Instant>);
     loop {
         match sock.recv_from(&mut buf) {
-            Ok((n, src)) if signal::decode(&buf[..n]).is_some() => {
+            // a BYE is a past call hanging up, not a caller
+            Ok((n, src)) if signal::decode(&buf[..n]).is_some_and(|m| m.kind != signal::Kind::Bye) => {
                 eprintln!("v2v: answering {src}");
                 return src;
             }
@@ -278,7 +289,8 @@ fn answer(sock: &UdpSocket, nonce: u64) -> SocketAddr {
 }
 
 /// minifb on the main thread, the menu (if there is a terminal) in its own thread; either one ending hangs up.
-fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAddr, tty: bool) {
+/// Returns the process exit code.
+fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAddr, tty: bool) -> i32 {
     let title = if sh.offline { "v2v config - camera preview".to_string() } else { format!("v2v - {peer}") };
     let opts = WindowOptions { resize: true, scale_mode: ScaleMode::AspectRatioStretch, ..Default::default() };
     // window first: minifb may print to stderr while creating it, which must not land in the TUI
@@ -287,17 +299,22 @@ fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAdd
         let (sh, t) = (sh.clone(), if sh.offline { "v2v config".to_string() } else { format!("v2v call — {peer}") });
         thread::spawn(move || tui::run(sh, t))
     });
-    match win {
+    let code = match win {
         Ok(mut win) => {
             win.set_target_fps(30);
             let gray = (320, 240, vec![0x404040u32; 320 * 240]); // "waiting" / camera off
             let mut shown = gray.clone();
+            let mut shown_at = None::<Instant>; // when `shown` arrived; None while it is the gray one
             let mut me: Option<(Arc<image::RgbImage>, bool, Vec<u32>)> = None; // converted self-view cache
             let mut buf = Vec::new();
             while win.is_open() && !win.is_key_down(Key::Escape) && !sh.quit.load(Relaxed) {
                 let new = frame.lock().unwrap().take(); // convert outside the lock
                 if let Some(img) = new {
                     shown = (img.width() as usize, img.height() as usize, video::to_argb(&img, false));
+                    shown_at = Some(Instant::now());
+                } else if shown_at.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+                    // the peer turned its video off or stalled: do not freeze on its last picture
+                    (shown, shown_at) = (gray.clone(), None);
                 }
                 let (mirror, show_self) = {
                     let s = sh.settings.lock().unwrap();
@@ -333,10 +350,11 @@ fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAdd
                     break;
                 }
             }
+            0
         }
         Err(e) if ui.is_none() => {
             eprintln!("v2v: cannot open window: {e}");
-            std::process::exit(1);
+            1
         }
         Err(e) => {
             // straight to the status line: the menu thread may not have taken over stderr yet
@@ -344,13 +362,15 @@ fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAdd
             while !sh.quit.load(Relaxed) {
                 thread::sleep(Duration::from_millis(50));
             }
+            0
         }
-    }
+    };
     sh.quit.store(true, Relaxed);
     if let Some(Ok(Err(e))) = ui.map(|t| t.join()) {
         eprintln!("v2v: terminal error: {e}");
-        std::process::exit(1);
+        return 1;
     }
+    code
 }
 
 #[cfg(test)]
@@ -378,5 +398,25 @@ mod tests {
         ] {
             assert_eq!(p(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn answer_ignores_bye() {
+        let bind = || UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (a, b, c) = (bind(), bind(), bind());
+        let to = a.local_addr().unwrap();
+        let waiter = thread::spawn(move || answer(&a, 7));
+        b.send_to(b"junk", to).unwrap();
+        b.send_to(&signal::bye(9), to).unwrap();
+        c.send_to(&signal::hello(5), to).unwrap();
+        assert_eq!(waiter.join().unwrap(), c.local_addr().unwrap());
+        // the junk got a HELLO (rate-limited, so none for the BYE right after it)
+        b.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut buf = [0u8; 2048];
+        let mut got = Vec::new();
+        while let Ok(n) = b.recv(&mut buf) {
+            got.push(signal::decode(&buf[..n]).map(|m| (m.kind, m.nonce)));
+        }
+        assert_eq!(got, [Some((signal::Kind::Hello, 7))]);
     }
 }

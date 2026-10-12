@@ -3,8 +3,10 @@
 Peer-to-peer video calls from the terminal.
 
 ```sh
-cargo install --path .
+cargo install --path . && cargo install tplay
 ```
+
+`tplay` is only needed for `--tplay`, which also needs `ffprobe` from your ffmpeg package (`apt install ffmpeg`).
 
 On one machine:
 
@@ -32,7 +34,7 @@ becomes the call menu.
 | `v2v <ip>` | video call: each side runs `v2v` with the other's IP, and the call connects when both are running |
 | `v2v` | answer the first caller instead (only needed if NAT rewrites the caller's address) |
 | `v2v --audio [<ip>]` | audio only, with a spectrum of the other side's voice in the terminal |
-| `v2v --tplay [<ip>]` | video as ASCII art in the terminal via [tplay](https://github.com/maxcurzi/tplay) (needs `tplay` and `ffprobe`) |
+| `v2v --tplay [<ip>]` | video as ASCII art in the terminal via [tplay](https://github.com/maxcurzi/tplay) |
 | `v2v config` | the same menu without calling, with a camera preview, to test devices |
 | `v2v -h` | help, including the exact command the other side should run for each of your addresses |
 

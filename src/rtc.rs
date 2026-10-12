@@ -10,7 +10,7 @@ use crate::signal::{self, Kind, Reassembler};
 use crate::video::Encoded;
 use std::hash::BuildHasher;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -112,37 +112,7 @@ pub fn run(sock: UdpSocket, peer: SocketAddr, nonce: u64, sh: Arc<Shared>, io: I
 
 /// `bye`: false only in tests, to look like a crashed peer.
 fn call(sock: UdpSocket, peer: SocketAddr, nonce: u64, sh: Arc<Shared>, io: Io, bye: bool) {
-    let codecs = OpusEnc::new().and_then(|e| Ok((e, OpusDec::new()?)));
-    let (opus_enc, opus_dec) = match codecs {
-        Ok(c) => c,
-        Err(e) => return sh.log(e),
-    };
-    let mut s = Session {
-        rtc: Rtc::new(Instant::now()), // replaced by reset()
-        sh,
-        sock,
-        peer,
-        dial: peer,
-        local: peer,
-        nonce: 0,
-        peer_nonce: None,
-        sig: Sig::Hello,
-        reasm: Reassembler::default(),
-        next_sig: Instant::now(),
-        desired: 0,
-        vmid: None,
-        amid: None,
-        connected: false,
-        lost_since: None,
-        last_pli: None,
-        self_call: false,
-        io,
-        opus_enc,
-        opus_dec,
-        audio_n: 0,
-        last_audio: None,
-    };
-    s.reset("calling");
+    let Some(mut s) = Session::new(sock, peer, sh, io) else { return };
     s.nonce = nonce; // later resets pick fresh ones
     s.run();
     if bye && !s.sh.peer_bye.load(Relaxed) {
@@ -152,7 +122,50 @@ fn call(sock: UdpSocket, peer: SocketAddr, nonce: u64, sh: Arc<Shared>, io: Io, 
     }
 }
 
+/// None = duplicate or late; otherwise how many packets are missing before `seq`.
+fn audio_gap(last: Option<u64>, seq: u64) -> Option<u64> {
+    last.map_or(Some(0), |l| (seq > l).then(|| seq - l - 1))
+}
+
 impl Session {
+    fn new(sock: UdpSocket, peer: SocketAddr, sh: Arc<Shared>, io: Io) -> Option<Self> {
+        let codecs = OpusEnc::new().and_then(|e| Ok((e, OpusDec::new()?)));
+        let (opus_enc, opus_dec) = match codecs {
+            Ok(c) => c,
+            Err(e) => {
+                sh.log(e);
+                return None;
+            }
+        };
+        let mut s = Session {
+            rtc: Rtc::new(Instant::now()), // replaced by reset()
+            sh,
+            sock,
+            peer,
+            dial: peer,
+            local: peer,
+            nonce: 0,
+            peer_nonce: None,
+            sig: Sig::Hello,
+            reasm: Reassembler::default(),
+            next_sig: Instant::now(),
+            desired: 0,
+            vmid: None,
+            amid: None,
+            connected: false,
+            lost_since: None,
+            last_pli: None,
+            self_call: false,
+            io,
+            opus_enc,
+            opus_dec,
+            audio_n: 0,
+            last_audio: None,
+        };
+        s.reset("calling");
+        Some(s)
+    }
+
     /// A fresh str0m session and signalling state with a new nonce, so the peer notices and resets too.
     fn reset(&mut self, why: &str) {
         self.peer = self.dial;
@@ -267,8 +280,13 @@ impl Session {
             };
             let pkt = &buf[..n];
             if let Some(m) = signal::decode(pkt) {
-                // until we know the peer, take it from anywhere: a caller's packets may arrive SNATed
-                if self.peer_nonce.is_none() || source.ip() == self.peer.ip() {
+                // only from the peer's IP; a peer behind NAT is called with plain `v2v` (answer mode), whose dial is its source
+                // shortcut: IPv6 matches the /64 so privacy (temporary) source addresses work; a host on that /64 could still interfere
+                let ok = match (source.ip(), self.dial.ip()) {
+                    (IpAddr::V6(a), IpAddr::V6(b)) => a.segments()[..4] == b.segments()[..4],
+                    (a, b) => a == b,
+                };
+                if ok {
                     self.on_signal(m, source);
                     timeout = self.drain();
                 }
@@ -376,10 +394,7 @@ impl Session {
     fn on_audio(&mut self, d: &MediaData) {
         let seq = **d.seq_range.start();
         let st = &self.sh.stats;
-        let gap = self.last_audio.map_or(0, |l| seq.saturating_sub(l + 1));
-        if self.last_audio.is_some_and(|l| seq <= l) {
-            return; // duplicate or late
-        }
+        let Some(gap) = audio_gap(self.last_audio, seq) else { return };
         self.last_audio = Some(seq);
         st.audio_rx.fetch_add(1, Relaxed);
         st.audio_lost.fetch_add(gap.min(50), Relaxed);
@@ -453,7 +468,7 @@ impl Session {
 
     fn on_signal(&mut self, m: signal::Msg, source: SocketAddr) {
         if m.kind == Kind::Bye {
-            if self.peer_nonce == Some(m.nonce) {
+            if self.peer_nonce.is_none_or(|n| n == m.nonce) {
                 self.set_link("peer hung up".into());
                 self.sh.peer_bye.store(true, Relaxed);
                 self.sh.quit.store(true, Relaxed);
@@ -463,7 +478,7 @@ impl Session {
         if self.peer_nonce.is_some_and(|n| n != m.nonce) && m.nonce != self.nonce {
             self.reset("peer restarted, reconnecting");
         }
-        self.peer = source; // always reply to where the peer's packets come from (SNAT)
+        self.peer = source; // always reply to the port the peer's packets come from (SNAT)
         match (m.kind, &mut self.sig) {
             (Kind::Hello, Sig::Hello) => match signal::we_offer(self.nonce, m.nonce) {
                 Some(true) => {
@@ -492,15 +507,8 @@ impl Session {
             },
             // a late HELLO from a peer that has not seen our OFFER yet
             (Kind::Hello, Sig::Offering(..)) => self.send_signal(),
-            (Kind::Offer, Sig::Hello | Sig::Answered(_) | Sig::Offering(..)) => {
-                let glare = matches!(self.sig, Sig::Offering(..));
-                if glare && m.nonce < self.nonce {
-                    return; // both offered (one of us restarted): the higher nonce's offer stands
-                }
+            (Kind::Offer, Sig::Hello | Sig::Answered(_)) => {
                 let Some(sdp) = self.reasm.push(&m) else { return };
-                if glare {
-                    self.new_rtc(); // drop our own offer and answer theirs
-                }
                 if let Sig::Hello = self.sig {
                     self.peer_nonce = Some(m.nonce);
                     let answer = SdpOffer::from_sdp_string(&sdp).map_err(|e| e.to_string()).and_then(|o| {
@@ -651,6 +659,60 @@ mod tests {
         }
         assert!(b.sh.peer_bye.load(Relaxed), "b did not hear the hang-up");
         stop(b);
+    }
+
+    #[test]
+    fn stranger_cannot_take_over() {
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        let x = UdpSocket::bind("127.0.0.2:0").unwrap();
+        x.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let offer = signal::chunks(Kind::Offer, u64::MAX, "v=0\r\n").unwrap().remove(0);
+        let spam = || {
+            for _ in 0..10 {
+                let _ = x.send_to(&signal::hello(u64::MAX), aa);
+                let _ = x.send_to(&offer, aa);
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // first while a is still waiting for b (the window before the peer's nonce is known), then mid-call
+        let a = side(a, ba, true);
+        spam();
+        let b = side(b, aa, true);
+        wait_media(&a, "a");
+        wait_media(&b, "b");
+        spam();
+        a.sh.stats.audio_rx.store(0, Relaxed);
+        let _ = a.video.try_iter().count();
+        b.sh.keyframe.store(true, Relaxed); // wait_media's fresh decoder needs an IDR
+        wait_media(&a, "a after the stranger");
+        assert!(x.recv_from(&mut [0u8; 2048]).is_err(), "the stranger got a reply");
+        stop(a);
+        stop(b);
+    }
+
+    #[test]
+    fn offering_ignores_offer_with_own_nonce() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let sh = Arc::new(Shared::new(Settings::default(), false));
+        let (_pcm_tx, pcm_in) = sync_channel(1);
+        let player = Player::new(sh.clone(), Arc::default(), Arc::default());
+        let mut s = Session::new(sock, peer, sh, Io { video_in: None, pcm_in, video_out: None, player }).unwrap();
+        s.nonce = u64::MAX;
+        s.on_signal(signal::decode(&signal::hello(1)).unwrap(), peer);
+        assert!(matches!(s.sig, Sig::Offering(..)));
+        let offer = signal::chunks(Kind::Offer, u64::MAX, "v=0\r\n").unwrap().remove(0);
+        s.on_signal(signal::decode(&offer).unwrap(), peer);
+        assert!(matches!(s.sig, Sig::Offering(..)));
+    }
+
+    #[test]
+    fn audio_gap_cases() {
+        for (last, seq, want) in [(None, 7, Some(0)), (Some(7), 8, Some(0)), (Some(7), 9, Some(1)), (Some(7), 7, None), (Some(7), 6, None), (Some(7), 100, Some(92))] {
+            assert_eq!(audio_gap(last, seq), want, "{last:?} {seq}");
+        }
     }
 
     #[test]

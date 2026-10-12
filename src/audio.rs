@@ -53,14 +53,13 @@ pub struct Denoiser {
 }
 
 const FRAME: usize = DenoiseState::FRAME_SIZE;
-const DENOISE_RATE: u32 = RATE;
 
 impl Denoiser {
     pub fn new(rate: u32) -> Self {
         let cap = 4 * FRAME;
         Denoiser {
             st: DenoiseState::new(),
-            up: Resampler::new(rate, DENOISE_RATE),
+            up: Resampler::new(rate, RATE),
             inbuf: Vec::with_capacity(cap),
             prev: [0.0; FRAME],
             out: Vec::with_capacity(cap),
@@ -114,8 +113,14 @@ impl AudioIo {
         AudioIo { sh, jitter, pcm, mic: (None, None), spk: (None, None) }
     }
 
-    /// Opens or reopens streams whose device setting changed. A failed device is not retried until it changes.
+    /// Opens or reopens streams whose device setting changed or whose device died (unplugged, server
+    /// restart). A device that fails to open is not retried until the setting changes.
     pub fn sync(&mut self) {
+        for (dev, live) in [&mut self.mic, &mut self.spk] {
+            if live.as_ref().is_some_and(|l| !l.alive.load(Relaxed)) {
+                *dev = None;
+            }
+        }
         let (mic, spk) = {
             let s = self.sh.settings.lock().unwrap();
             (s.mic.clone(), s.speaker.clone())
@@ -163,7 +168,10 @@ impl AudioIo {
         let mut pending: Vec<i16> = Vec::with_capacity(4 * PKT);
         let mut block: Vec<f32> = Vec::new();
         let (sh, tx) = (self.sh.clone(), self.pcm.clone());
-        let (mut muted, mut noise) = (false, false);
+        let (mut muted, mut noise) = {
+            let s = self.sh.settings.lock().unwrap(); // seed: the first callback's try_lock may fail
+            (s.mute_mic, s.noise)
+        };
         let on_data = move |mono: &mut dyn Iterator<Item = f32>| {
             block.clear();
             block.extend(mono);
@@ -294,7 +302,11 @@ impl AudioIo {
     fn on_error(&self, what: &'static str, alive: &Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
         let (sh, alive) = (self.sh.clone(), alive.clone());
         move |e| {
-            if alive.load(Relaxed) {
+            use cpal::ErrorKind::{DeviceNotAvailable, StreamInvalidated};
+            let dead = matches!(e.kind(), DeviceNotAvailable | StreamInvalidated);
+            // a dead stream is flagged once for sync() to reopen; errors after our own drop stay quiet
+            let was_alive = if dead { alive.swap(false, Relaxed) } else { alive.load(Relaxed) };
+            if was_alive {
                 sh.log(format!("{what} error: {e}"));
             }
         }
@@ -333,12 +345,14 @@ impl Player {
                 q.clear();
             }
             // drift control: audio the queue never needed during the last second is extra latency
-            // (after a burst, or a sender clock running fast), so play it out 1% faster until it is gone
+            // (after a burst, or a sender clock running fast), so play it out 1% faster until it is gone;
+            // a queue that nearly ran dry (sender clock slow) gets 1% slower so it stops underrunning
             self.low = self.low.min(q.len());
             self.pushes += 1;
             if self.pushes == 50 {
-                let fast = self.low > self.out_rate as usize / 25; // 40 ms
-                self.rs.step = RATE as f64 / self.out_rate as f64 * if fast { 1.01 } else { 1.0 };
+                let r = self.out_rate as usize;
+                let k = if self.low > r / 25 { 1.01 } else if self.low < r / 100 { 0.99 } else { 1.0 }; // 40 ms, 10 ms
+                self.rs.step = RATE as f64 / self.out_rate as f64 * k;
                 (self.low, self.pushes) = (usize::MAX, 0);
             }
             samples.clone().for_each(|x| self.rs.push(x, |v| q.push_back(v)));
@@ -501,6 +515,23 @@ mod tests {
         assert!((28..=42).contains(&left), "{left} ms queued"); // 40 ms target, minus up to one window of 1% speed-up
     }
 
+    #[test]
+    fn player_slows_down_for_slow_sender() {
+        let sh = Arc::new(Shared::new(crate::config::Settings::default(), false));
+        let jitter: Jitter = Arc::default();
+        let mut p = Player::new(sh, jitter.clone(), Arc::default());
+        for _ in 0..3 {
+            p.push(&[0; PKT]); // 60 ms cushion
+        }
+        // the speaker takes 0.5% more than arrives: without drift control the cushion is gone after ~580 pushes
+        for i in 0..3000 {
+            p.push(&[0; PKT]);
+            let mut q = jitter.lock().unwrap();
+            assert!(q.len() >= PKT + 5, "underrun at push {i}: {} queued", q.len());
+            q.drain(..PKT + 5);
+        }
+    }
+
     fn white_noise(n: usize) -> Vec<f32> {
         let mut x = 0x2545_f491_u32;
         (0..n)
@@ -515,7 +546,7 @@ mod tests {
 
     /// Runs `input` through a 48 kHz denoiser in odd-sized blocks, like a cpal callback would.
     fn run(input: &[f32], on: impl Fn(usize) -> bool) -> Vec<f32> {
-        let mut d = Denoiser::new(DENOISE_RATE);
+        let mut d = Denoiser::new(RATE);
         let mut out = Vec::new();
         for (i, b) in input.chunks(333).enumerate() {
             out.extend_from_slice(d.process(b, on(i)));

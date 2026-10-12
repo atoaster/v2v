@@ -65,15 +65,18 @@ fn spectrum(samples: &[f32], cols: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Leaves raw mode and the alternate screen, and shows the cursor again.
+pub fn restore() {
+    use ratatui::crossterm::{cursor, execute, style::ResetColor, terminal};
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(std::io::stdout(), ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
+}
+
 /// Live spectrum of the received audio until q/Esc/Ctrl-C; the terminal is restored on return or panic.
 pub fn run_audio(peer: IpAddr, tap: Tap, mic: &AtomicU32, quit: &AtomicBool) -> std::io::Result<()> {
     use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use ratatui::crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+    use ratatui::crossterm::style::{Color, Print, SetForegroundColor};
     use ratatui::crossterm::{cursor, execute, queue, terminal};
-    fn restore() {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stdout(), ResetColor, cursor::Show, terminal::LeaveAlternateScreen);
-    }
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
