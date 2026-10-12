@@ -29,8 +29,8 @@ becomes the call menu.
 
 | Command | |
 | --- | --- |
-| `v2v <ip>` | video call |
-| `v2v` | answer the first caller and reply to wherever its packets come from (works behind NAT) |
+| `v2v <ip>` | video call: each side runs `v2v` with the other's IP, and the call connects when both are running |
+| `v2v` | answer the first caller instead (only needed if NAT rewrites the caller's address) |
 | `v2v --audio [<ip>]` | audio only, with a spectrum of the other side's voice in the terminal |
 | `v2v --tplay [<ip>]` | video as ASCII art in the terminal via [tplay](https://github.com/maxcurzi/tplay) (needs `tplay` and `ffprobe`) |
 | `v2v config` | the same menu without calling, with a camera preview, to test devices |
