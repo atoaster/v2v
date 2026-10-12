@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cpal = "0.18.2"
+cpal = { version = "0.18.2", features = ["pipewire"] }
 if-addrs = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 minifb = "0.29.0"
 nokhwa = { version = "0.10.11", features = ["input-native"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+tract-onnx = "=0.23.8"
+nnnoiseless = { version = "0.5.2", default-features = false }
+
+# the denoiser is ~15x slower unoptimized; keep debug builds real-time
+[profile.dev.package.nnnoiseless]
+opt-level = 3
