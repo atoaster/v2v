@@ -81,3 +81,7 @@ no encryption and no authentication beyond ignoring packets that do not come fro
 ## Linux build deps
 
 `libpipewire-0.3-dev` and `libasound2-dev` (audio; PipeWire is used when running, ALSA otherwise), `clang`/`libclang-dev` and Linux kernel headers (V4L2 camera bindings via bindgen), X11/Wayland dev libs for the window.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The bundled segmentation model keeps its own Apache-2.0 license (above).
