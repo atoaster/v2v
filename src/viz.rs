@@ -1,13 +1,14 @@
 //! `--audio` mode: full-screen spectrum of the peer's voice.
 
-use crate::net::RATE;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Sample rate of the tap: received audio is downsampled to this for the spectrum.
+pub const RATE: u32 = 16_000;
 pub const FFT_N: usize = 1024; // visualizer window, 64 ms at 16 kHz
 
 pub type Tap = Arc<Mutex<(VecDeque<f32>, Option<Instant>)>>; // last FFT_N received samples, when received
@@ -65,7 +66,7 @@ fn spectrum(samples: &[f32], cols: usize) -> Vec<f32> {
 }
 
 /// Live spectrum of the received audio until q/Esc/Ctrl-C; the terminal is restored on return or panic.
-pub fn run_audio(peer: IpAddr, tap: Tap, mic: &AtomicU32) -> std::io::Result<()> {
+pub fn run_audio(peer: IpAddr, tap: Tap, mic: &AtomicU32, quit: &AtomicBool) -> std::io::Result<()> {
     use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
     use ratatui::crossterm::{cursor, execute, queue, terminal};
@@ -97,7 +98,7 @@ pub fn run_audio(peer: IpAddr, tap: Tap, mic: &AtomicU32) -> std::io::Result<()>
     const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let mut bars: Vec<f32> = Vec::new();
     let mut out = Vec::new();
-    loop {
+    while !quit.load(Ordering::Relaxed) {
         let (w, h) = terminal::size()?;
         let (w, h, bh) = (w as usize, h, h.saturating_sub(2)); // rows: header, mic meter, bars
         let (samples, fresh) = {
@@ -152,6 +153,7 @@ pub fn run_audio(peer: IpAddr, tap: Tap, mic: &AtomicU32) -> std::io::Result<()>
             }
         }
     }
+    Ok(()) // the peer hung up
 }
 
 #[cfg(test)]

@@ -1,20 +1,23 @@
 mod audio;
 mod blur;
 mod config;
-mod net;
+mod rtc;
+mod signal;
 mod tplay;
 mod tui;
 mod video;
 mod viz;
 
 use minifb::{Key, ScaleMode, Window, WindowOptions};
-use net::{Frame, PORT, RATE, Stats};
+use rtc::{PORT, Stats};
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use video::Frame;
 
 /// State shared by the UI, audio callbacks, camera and network threads.
 pub struct Shared {
@@ -26,6 +29,9 @@ pub struct Shared {
     pub out_rate: AtomicU32,    // current speaker sample rate
     pub tone: AtomicU32,        // test-tone samples still to play
     pub stats: Stats,
+    pub keyframe: AtomicBool,      // the peer needs an IDR from our encoder
+    pub want_keyframe: AtomicBool, // our decoder needs an IDR from the peer (sent as a PLI)
+    pub peer_bye: AtomicBool,   // the peer hung up (its BYE ended our call)
     pub tui: AtomicBool,        // while set, warnings go to the status line instead of stderr
     pub status: Mutex<String>,
     pub start: Instant,
@@ -39,9 +45,12 @@ impl Shared {
             offline,
             loopback: AtomicBool::new(false),
             mic_level: AtomicU32::new(0),
-            out_rate: AtomicU32::new(RATE),
+            out_rate: AtomicU32::new(audio::RATE),
             tone: AtomicU32::new(0),
             stats: Stats::default(),
+            keyframe: AtomicBool::new(false),
+            want_keyframe: AtomicBool::new(false),
+            peer_bye: AtomicBool::new(false),
             tui: AtomicBool::new(false),
             status: Mutex::new(String::new()),
             start: Instant::now(),
@@ -95,7 +104,7 @@ fn help(color: bool) -> String {
     let cmd = |t: &str| c("32", t);
     let dim = |t: &str| c("2", t);
     let mut s = format!(
-        "{} - peer-to-peer video call over UDP port 47000\n\n\
+        "{} - peer-to-peer video call (WebRTC: H.264 + Opus) over UDP port 47000\n\n\
          {} v2v [--tplay | --audio] [<ip_address>]\n       v2v config\n\n\
          Calls <ip_address> with your camera and mic. Without an address, v2v waits and answers\n\
          the first v2v that calls, replying to wherever its packets come from (works through NAT).\n\
@@ -149,7 +158,7 @@ fn main() {
             eprintln!("v2v: config is an interactive menu, but stdin/stdout is not a terminal");
             std::process::exit(1);
         }
-        (Some(Ipv4Addr::LOCALHOST.into()), Mode::Window)
+        (None, Mode::Window)
     } else {
         parse_args(&args).unwrap_or_else(|| {
             eprintln!("usage: v2v [--tplay | --audio] [<ip_address>]\n       v2v config\n       v2v -h");
@@ -160,65 +169,104 @@ fn main() {
         eprintln!("v2v: --audio draws in the terminal, but stdout is not a terminal");
         std::process::exit(1);
     }
-    // shortcut: answering listens on IPv4 only; bind [::] and unmap v4-mapped sources if v6 callers matter
-    let any: IpAddr = if peer.is_none_or(|p| p.is_ipv4()) { Ipv4Addr::UNSPECIFIED.into() } else { Ipv6Addr::UNSPECIFIED.into() };
-    // config mode: a private loopback socket, only used for "hear yourself"
-    let bind = match peer {
-        Some(p) if offline => SocketAddr::new(p, 0),
-        _ => SocketAddr::new(any, PORT),
-    };
-    let sock = UdpSocket::bind(bind).unwrap_or_else(|e| {
-        eprintln!("v2v: cannot bind UDP port {}: {e}", bind.port());
-        std::process::exit(1);
-    });
-    let dest = match peer {
-        _ if offline => sock.local_addr().expect("local address"),
-        Some(p) => SocketAddr::new(p, PORT),
-        None => answer(&sock),
-    };
-    let peer = dest.ip();
-    let clone = || sock.try_clone().expect("clone UDP socket");
-
     let mut settings = config::load();
     if mode != Mode::Window || !tty {
         // no menu to undo a remembered mute / video off, so these modes always start live
         (settings.mute_mic, settings.video_off) = (false, false);
     }
+    // calling an address of this machine: one socket cannot be both WebRTC peers, so skip the network
+    let self_call = peer.is_some_and(|p| p.is_loopback() || if_addrs::get_if_addrs().is_ok_and(|l| l.iter().any(|i| i.ip() == p)));
+    // the call socket; `v2v config` sends nothing and has none
+    let call = (!offline && !self_call).then(|| {
+        // shortcut: answering listens on IPv4 only; bind [::] and unmap v4-mapped sources if v6 callers matter
+        let any: IpAddr = if peer.is_none_or(|p| p.is_ipv4()) { Ipv4Addr::UNSPECIFIED.into() } else { Ipv6Addr::UNSPECIFIED.into() };
+        let sock = UdpSocket::bind(SocketAddr::new(any, PORT)).unwrap_or_else(|e| {
+            eprintln!("v2v: cannot bind UDP port {PORT}: {e}");
+            std::process::exit(1);
+        });
+        let nonce = rtc::random();
+        let dest = match peer {
+            Some(p) => SocketAddr::new(p, PORT),
+            None => answer(&sock, nonce),
+        };
+        (sock, dest, nonce)
+    });
+    let peer = call.as_ref().map(|c| c.1.ip()).or(peer).unwrap_or(Ipv4Addr::LOCALHOST.into());
+
     let sh = Arc::new(Shared::new(settings, offline));
     let frame: Frame = Arc::default();
     let jitter: audio::Jitter = Arc::default();
-    let mut io = audio::AudioIo::new(sh.clone(), jitter.clone(), clone(), dest);
+    let tap: viz::Tap = Arc::default();
+    let (pcm_tx, pcm_rx) = sync_channel(50); // 1 s of 20 ms frames
+    let mut io = audio::AudioIo::new(sh.clone(), jitter.clone(), pcm_tx);
     io.sync(); // first open before any UI, so its warnings land on the normal screen
     io.spawn();
+    let player = audio::Player::new(sh.clone(), jitter, tap.clone());
     let selfv = video::SelfView::default();
+    let (video_tx, video_rx) = sync_channel(4);
     if mode != Mode::Audio {
-        let (sh, net, selfv) = (sh.clone(), (!offline).then(|| (clone(), dest)), selfv.clone());
+        let (sh, net, selfv) = (sh.clone(), (!offline).then_some(video_tx), selfv.clone());
         thread::spawn(move || video::camera_loop(sh, net, selfv));
     }
-    let tap: viz::Tap = Arc::default();
-    let (rsock, rframe, rtap, rsh) = (clone(), (mode != Mode::Audio).then(|| frame.clone()), tap.clone(), sh.clone());
-    thread::spawn(move || net::recv_loop(rsock, peer, rframe, jitter, rtap, rsh));
+    let video_out = (mode != Mode::Audio && !offline).then(|| {
+        let (tx, rx) = sync_channel(8);
+        let (frame, sh) = (frame.clone(), sh.clone());
+        thread::spawn(move || video::decode_loop(rx, frame, sh));
+        tx
+    });
+    let mut net = None;
+    if let Some((sock, dest, nonce)) = call {
+        let io = rtc::Io { video_in: (mode != Mode::Audio).then_some(video_rx), pcm_in: pcm_rx, video_out, player };
+        let sh = sh.clone();
+        net = Some(thread::spawn(move || rtc::run(sock, dest, nonce, sh, io)));
+    } else {
+        if self_call {
+            // self-test: own camera and mic through the codecs, as the peer would get them
+            sh.stats.video_bps.store(2_000_000, Relaxed);
+            *sh.stats.link.lock().unwrap() = "yourself, no network".into();
+            if let Some(tx) = video_out {
+                thread::spawn(move || video_rx.into_iter().for_each(|(au, _)| _ = tx.send(au.into())));
+            }
+        }
+        thread::spawn(move || audio::loopback(pcm_rx, player));
+    }
     match mode {
-        Mode::Tplay => tplay::run_tplay(frame, peer),
+        Mode::Tplay => tplay::run_tplay(frame, peer, &sh.quit),
         Mode::Audio => {
-            if let Err(e) = viz::run_audio(peer, tap, &sh.mic_level) {
+            if let Err(e) = viz::run_audio(peer, tap, &sh.mic_level, &sh.quit) {
                 eprintln!("v2v: terminal error: {e}");
                 std::process::exit(1);
             }
         }
-        Mode::Window => run_window(sh, frame, selfv, peer, tty),
+        Mode::Window => run_window(sh.clone(), frame, selfv, peer, tty),
+    }
+    sh.quit.store(true, Relaxed);
+    // the network thread sends the BYE on its way out (within a few ms)
+    if let Some(net) = net {
+        let _ = net.join();
+    }
+    if sh.peer_bye.load(Relaxed) {
+        eprintln!("v2v: the other side hung up");
     }
 }
 
-/// Waits for the first valid v2v packet and returns where it came from; replying there gets through NAT.
-fn answer(sock: &UdpSocket) -> SocketAddr {
+/// Waits for the caller's first signalling packet and returns where it came from; replying there gets through NAT.
+/// `nonce` is the one the call will start with, so a HELLO sent from here is not a stale nonce later.
+fn answer(sock: &UdpSocket, nonce: u64) -> SocketAddr {
     eprintln!("v2v: waiting for a call on UDP port {PORT} (Ctrl-C to cancel)...");
     let mut buf = [0u8; 2048];
+    let (hello, mut last) = (signal::hello(nonce), None::<Instant>);
     loop {
         match sock.recv_from(&mut buf) {
-            Ok((n, src)) if net::parse(&buf[..n]).is_some() => {
+            Ok((n, src)) if signal::decode(&buf[..n]).is_some() => {
                 eprintln!("v2v: answering {src}");
                 return src;
+            }
+            // media from a call this side was in before a restart: a HELLO with a new nonce makes
+            // that peer renegotiate now instead of after its 5 s silence timeout
+            Ok((_, src)) if last.is_none_or(|t| t.elapsed() > Duration::from_millis(300)) => {
+                last = Some(Instant::now());
+                let _ = sock.send_to(&hello, src);
             }
             Ok(_) => {}
             Err(e) => {
@@ -247,9 +295,9 @@ fn run_window(sh: Arc<Shared>, frame: Frame, selfv: video::SelfView, peer: IpAdd
             let mut me: Option<(Arc<image::RgbImage>, bool, Vec<u32>)> = None; // converted self-view cache
             let mut buf = Vec::new();
             while win.is_open() && !win.is_key_down(Key::Escape) && !sh.quit.load(Relaxed) {
-                let jpeg = frame.lock().unwrap().take(); // decode outside the lock
-                if let Some(f) = jpeg.and_then(|j| video::decode(&j)) {
-                    shown = f;
+                let new = frame.lock().unwrap().take(); // convert outside the lock
+                if let Some(img) = new {
+                    shown = (img.width() as usize, img.height() as usize, video::to_argb(&img, false));
                 }
                 let (mirror, show_self) = {
                     let s = sh.settings.lock().unwrap();

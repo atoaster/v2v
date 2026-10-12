@@ -1,29 +1,123 @@
-//! Camera capture thread, effects hook, and the window-side helpers (decode, mirror, picture-in-picture).
+//! Camera capture thread, effects hook, H.264 encode/decode, and the window-side helpers (mirror, picture-in-picture).
 
 use crate::Shared;
 use crate::blur::Segmenter;
-use crate::net::{CHUNK, MAX_CHUNKS, rand_u32, video_packets};
-use image::{ImageFormat, ImageReader, Limits, RgbImage};
+use image::RgbImage;
 use nokhwa::utils::CameraIndex;
-use std::io::Cursor;
-use std::net::{SocketAddr, UdpSocket};
+use openh264::decoder::Decoder;
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Level, Profile, RateControlMode, UsageType};
+use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+use openh264::{OpenH264API, Timestamp};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Latest processed (effects applied, not mirrored) own camera frame; None while the camera is off.
 pub type SelfView = Arc<Mutex<Option<Arc<RgbImage>>>>;
+/// Latest decoded picture from the peer.
+pub type Frame = Arc<Mutex<Option<Arc<RgbImage>>>>;
+/// One encoded H.264 access unit (Annex-B) and when it was captured.
+pub type Encoded = (Vec<u8>, Instant);
 
-pub fn decode(jpeg: &[u8]) -> Option<(usize, usize, Vec<u32>)> {
-    let mut r = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg);
-    let mut lim = Limits::default();
-    lim.max_image_width = Some(1920);
-    lim.max_image_height = Some(1920);
-    r.limits(lim);
-    let img = r.decode().ok()?.to_rgb8();
-    Some((img.width() as usize, img.height() as usize, to_argb(&img, false)))
+pub const FPS: u32 = 30;
+/// Below this target the picture is encoded at half size: 640x480 at ~150 kbit/s is mush.
+const SMALL_BPS: u32 = 400_000;
+
+/// H.264 (openh264) for the call, rate-controlled by the bitrate the network thread publishes.
+#[derive(Default)]
+struct H264 {
+    enc: Option<Encoder>,
+    dims: (u32, u32),
+    bps: u32,
+    small: bool,
+}
+
+impl H264 {
+    fn encode(&mut self, sh: &Shared, img: &RgbImage, at: Instant) -> Result<Vec<u8>, String> {
+        let target = sh.stats.video_bps.load(Relaxed);
+        // hysteresis, so a bitrate hovering around the threshold does not flip sizes every frame
+        // wide band: every switch costs a new encoder and an IDR, just when bandwidth is short
+        self.small = if self.small { target < SMALL_BPS * 3 / 2 } else { target < SMALL_BPS };
+        let k = if self.small { 2 } else { 1 };
+        let (w, h) = ((img.width() / k) & !1, (img.height() / k) & !1); // YUV 4:2:0 needs even sizes
+        let scaled;
+        let img = if (w, h) == img.dimensions() {
+            img
+        } else {
+            scaled = image::imageops::thumbnail(img, w, h);
+            &scaled
+        };
+        let enc = match &mut self.enc {
+            Some(enc) if self.dims == (w, h) => {
+                if target.abs_diff(self.bps) > self.bps / 10 {
+                    self.bps = target;
+                    set_bitrate(enc, target);
+                }
+                enc
+            }
+            _ => {
+                // a new encoder per size, started at the current target (openh264 resets to its config bitrate)
+                let cfg = EncoderConfig::new()
+                    .bitrate(BitRate::from_bps(target))
+                    .max_frame_rate(FrameRate::from_hz(FPS as f32))
+                    .usage_type(UsageType::CameraVideoRealTime)
+                    .rate_control_mode(RateControlMode::Bitrate)
+                    .profile(Profile::Baseline)
+                    .level(Level::Level_3_1)
+                    .skip_frames(true)
+                    .max_slice_len(1100); // one slice per RTP packet: a lost packet costs a slice, not a frame
+                (self.dims, self.bps) = ((w, h), target);
+                sh.keyframe.store(false, Relaxed); // a new encoder starts with an IDR anyway
+                let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())?;
+                let mut quiet = openh264_sys2::WELS_LOG_QUIET;
+                // SAFETY: TRACE_LEVEL is accepted before init and takes an int. Without it, init warns on stderr (over the TUI).
+                unsafe { enc.raw_api().set_option(openh264_sys2::ENCODER_OPTION_TRACE_LEVEL, (&raw mut quiet).cast()) };
+                self.enc.insert(enc)
+            }
+        };
+        if sh.keyframe.swap(false, Relaxed) {
+            enc.force_intra_frame();
+        }
+        let mut yuv = YUVBuffer::new(w as usize, h as usize);
+        yuv.read_rgb8(RgbSliceU8::new(img.as_raw(), (w as usize, h as usize)));
+        let ts = Timestamp::from_millis((at - sh.start).as_millis() as u64);
+        Ok(enc.encode_at(&yuv, ts).map_err(|e| e.to_string())?.to_vec())
+    }
+}
+
+/// Changes the target bitrate of an encoder that has encoded at least one frame.
+fn set_bitrate(enc: &mut Encoder, bps: u32) {
+    use openh264_sys2::*;
+    // the layer-0 maximum first: openh264 rejects a target above it
+    for (opt, layer) in [(ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_0), (ENCODER_OPTION_BITRATE, SPATIAL_LAYER_ALL)] {
+        let mut info = SBitrateInfo { iLayer: layer, iBitrate: bps as i32 };
+        // SAFETY: the encoder is initialised (first encode done); these options take an SBitrateInfo.
+        unsafe { enc.raw_api().set_option(opt, (&raw mut info).cast()) };
+    }
+}
+
+/// Decodes the peer's H.264 into `frame` until the sender (the network thread) goes away.
+/// A decode error asks the network thread for a keyframe.
+pub fn decode_loop(rx: Receiver<Arc<[u8]>>, frame: Frame, sh: Arc<Shared>) {
+    let mut dec = match Decoder::new() {
+        Ok(d) => d,
+        Err(e) => return sh.log(format!("no video decoder ({e})")),
+    };
+    for au in rx {
+        match dec.decode(&au) {
+            Ok(Some(yuv)) => {
+                let (w, h) = yuv.dimensions();
+                let mut img = RgbImage::new(w as u32, h as u32);
+                yuv.write_rgb8(&mut img);
+                sh.stats.rx_frames.fetch_add(1, Relaxed);
+                *frame.lock().unwrap() = Some(Arc::new(img));
+            }
+            Ok(None) => {}
+            Err(_) => sh.want_keyframe.store(true, Relaxed),
+        }
+    }
 }
 
 /// 0RGB pixels for minifb, optionally flipped left-right (mirror is for the local preview only).
@@ -56,7 +150,7 @@ pub fn pip(dst: &mut [u32], dw: usize, dh: usize, src: &[u32], sw: usize, sh: us
     }
 }
 
-/// Effects on each outgoing frame, applied before JPEG encode and self-view.
+/// Effects on each outgoing frame, applied before H.264 encode and self-view.
 /// The blur model loads the first time blur is on; any failure turns blur off and says why.
 pub fn apply_effects(sh: &Shared, seg: &mut Option<Segmenter>, img: &mut RgbImage, blur: bool) {
     if !blur {
@@ -175,12 +269,12 @@ fn capture(name: String, sh: Arc<Shared>, prev: Option<Receiver<()>>) -> (Captur
 
 /// Captures until hang-up, (re)opening the camera when the selection changes and closing it while video is off.
 /// `net` is None in `v2v config`: frames then only go to the self-view.
-pub fn camera_loop(sh: Arc<Shared>, net: Option<(UdpSocket, SocketAddr)>, selfv: SelfView) {
+pub fn camera_loop(sh: Arc<Shared>, net: Option<SyncSender<Encoded>>, selfv: SelfView) {
     let mut cap: Option<Capture> = None;
     let mut released: Option<Receiver<()>> = None; // closes once the last capture thread let go of its camera
     let mut seg: Option<Segmenter> = None;
     let mut applied: Option<Option<String>> = None; // camera wanted when we last (re)opened; Some(None) = video off
-    let (mut id, mut fails, mut last) = (rand_u32(), 0, Instant::now() - Duration::from_secs(1));
+    let (mut h264, mut fails, mut last) = (H264::default(), 0, Instant::now() - Duration::from_secs(1));
     while !sh.quit.load(Relaxed) {
         let (want, blur) = {
             let s = sh.settings.lock().unwrap();
@@ -219,8 +313,8 @@ pub fn camera_loop(sh: Arc<Shared>, net: Option<(UdpSocket, SocketAddr)>, selfv:
             }
         };
         fails = 0;
-        // shortcut: fixed ~15 fps cap (~1-3 Mbit/s), no congestion control; add adaptive bitrate if calls run over slow links
-        if last.elapsed() < Duration::from_millis(66) {
+        // cap the rate: the encoder's rate control assumes at most FPS
+        if last.elapsed() < Duration::from_millis(1000 / FPS as u64 - 3) {
             continue;
         }
         last = Instant::now();
@@ -231,22 +325,19 @@ pub fn camera_loop(sh: Arc<Shared>, net: Option<(UdpSocket, SocketAddr)>, selfv:
         apply_effects(&sh, &mut seg, &mut img, blur);
         let img = Arc::new(img);
         *selfv.lock().unwrap() = Some(img.clone());
-        let Some((sock, dest)) = &net else { continue };
-        let mut jpeg = Vec::new();
-        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 60);
-        if img.write_with_encoder(enc).is_err() || jpeg.len() > CHUNK * MAX_CHUNKS as usize {
-            continue;
-        }
-        let pkts = video_packets(id, &jpeg);
-        // spread a frame over ~40 ms: back-to-back bursts get dropped by VPN/router queues, and one lost chunk loses the frame
-        let gap = Duration::from_millis(40) / pkts.len().max(1) as u32;
-        for p in pkts {
-            if sock.send_to(&p, dest).is_ok() {
-                sh.stats.tx_bytes.fetch_add(p.len() as u64, Relaxed);
+        let Some(tx) = &net else { continue };
+        match h264.encode(&sh, &img, last) {
+            Ok(au) if au.is_empty() => {} // rate control skipped this frame
+            Ok(au) => {
+                if let Err(TrySendError::Full(_)) = tx.try_send((au, last)) {
+                    sh.keyframe.store(true, Relaxed); // the peer's decoder misses a frame: restart from an IDR
+                }
             }
-            thread::sleep(gap);
+            Err(e) => {
+                sh.log(format!("video encoder: {e}"));
+                h264 = H264::default();
+            }
         }
-        id = id.wrapping_add(1);
     }
 }
 

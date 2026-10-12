@@ -14,7 +14,18 @@ nokhwa = { version = "0.10.11", features = ["input-native"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 tract-onnx = "=0.23.8"
 nnnoiseless = { version = "0.5.2", default-features = false }
+# WebRTC, sans-IO; pure-Rust crypto (no aws-lc C build)
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
+# H.264 from bundled Cisco source (cc only; plain C without nasm)
+openh264 = "0.9.8"
+openh264-sys2 = "0.9.8" # SBitrateInfo / ENCODER_OPTION_* for runtime bitrate changes
+# libopus 1.3.1 translated to Rust: builds without cmake or a system libopus
+unsafe-libopus = "0.2.0"
 
 # the denoiser is ~15x slower unoptimized; keep debug builds real-time
 [profile.dev.package.nnnoiseless]
+opt-level = 3
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+[profile.dev.package.unsafe-libopus]
 opt-level = 3

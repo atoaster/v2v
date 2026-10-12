@@ -150,14 +150,22 @@ fn stats_text(sh: &Shared, prev: &Snap, now: &Snap) -> Vec<Line<'static>> {
         0 => "never".into(),
         t => format!("{:.1} s ago", (sh.start.elapsed().as_millis() as u64).saturating_sub(t) as f64 / 1000.0),
     };
-    let row = |k: &str, v: String| Line::from(vec![Span::styled(format!(" {k:<14}"), Style::new().fg(Color::DarkGray)), Span::raw(v)]);
+    let pct = |a: &std::sync::atomic::AtomicU32| format!("{:.1} %", 100.0 * f32::from_bits(a.load(Relaxed)));
+    let bwe = match st.bwe_bps.load(Relaxed) {
+        0 => "…".into(),
+        b => format!("{} kbit/s, video {}", b / 1000, st.video_bps.load(Relaxed) / 1000),
+    };
+    let row = |k: &str, v: String| Line::from(vec![Span::styled(format!(" {k:<10}"), Style::new().fg(Color::DarkGray)), Span::raw(v)]);
     vec![
+        row("link", st.link.lock().unwrap().clone()),
         row("send", kbit(now.tx, prev.tx)),
         row("receive", kbit(now.rx, prev.rx)),
+        row("estimate", bwe),
+        row("rtt", match st.rtt_ms.load(Relaxed) { 0 => "…".into(), ms => format!("{ms} ms") }),
+        row("loss", format!("in {} out {}", pct(&st.loss_in), pct(&st.loss_out))),
         row("video in", rate(&|dt| format!("{:.1} fps", (now.frames - prev.frames) as f64 / dt))),
-        row("audio loss", rate(&|_| format!("{:.1} %", loss_pct(now.lost - prev.lost, now.arx - prev.arx)))),
-        row("audio buffer", format!("{} ms", st.buffer_ms.load(Relaxed))),
-        row("peer heard", heard),
+        row("audio", rate(&|_| format!("{:.1} % lost, {} ms buf", loss_pct(now.lost - prev.lost, now.arx - prev.arx), st.buffer_ms.load(Relaxed)))),
+        row("heard", heard),
     ]
 }
 

@@ -1,22 +1,28 @@
-//! Microphone and speaker streams, live device switching, test tone, device lists.
+//! Microphone and speaker streams, live device switching, test tone, device lists, Opus, playout.
 
 use crate::Shared;
-use crate::net::{AUDIO, AUDIO_PKT, RATE, rand_u32};
+use crate::viz::{self, FFT_N, Tap};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 use nnnoiseless::DenoiseState;
 use std::collections::VecDeque;
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use unsafe_libopus as unsafe_opus;
 
 pub type Jitter = Arc<Mutex<VecDeque<f32>>>;
 
+/// Mic and Opus rate: 48 kHz mono, which is also what the denoiser produces.
+pub const RATE: u32 = 48_000;
+pub const PKT: usize = 960; // 20 ms
+pub type Pcm = [i16; PKT];
+
 /// Linear resampler, push style. shortcut: no low-pass filter, so downsampling aliases a bit; fine for voice.
 pub struct Resampler {
-    step: f64,
+    step: f64, // input samples per output sample
     pos: f64,
     prev: f32,
 }
@@ -47,7 +53,7 @@ pub struct Denoiser {
 }
 
 const FRAME: usize = DenoiseState::FRAME_SIZE;
-pub const DENOISE_RATE: u32 = 48_000;
+const DENOISE_RATE: u32 = RATE;
 
 impl Denoiser {
     pub fn new(rate: u32) -> Self {
@@ -98,17 +104,14 @@ impl Drop for Live {
 pub struct AudioIo {
     sh: Arc<Shared>,
     jitter: Jitter,
-    sock: UdpSocket,
-    dest: SocketAddr,
-    seq: Arc<AtomicU32>, // shared across mic rebuilds, so a switch is no seq jump for the peer
+    pcm: SyncSender<Pcm>, // 20 ms mic frames to the call (or the "hear yourself" loopback)
     mic: (Option<String>, Option<Live>), // (device id last tried, stream)
     spk: (Option<String>, Option<Live>),
 }
 
 impl AudioIo {
-    pub fn new(sh: Arc<Shared>, jitter: Jitter, sock: UdpSocket, dest: SocketAddr) -> Self {
-        let seq = Arc::new(AtomicU32::new(rand_u32()));
-        AudioIo { sh, jitter, sock, dest, seq, mic: (None, None), spk: (None, None) }
+    pub fn new(sh: Arc<Shared>, jitter: Jitter, pcm: SyncSender<Pcm>) -> Self {
+        AudioIo { sh, jitter, pcm, mic: (None, None), spk: (None, None) }
     }
 
     /// Opens or reopens streams whose device setting changed. A failed device is not retried until it changes.
@@ -156,21 +159,10 @@ impl AudioIo {
         let dev = self.device(id, true)?;
         let cfg = dev.default_input_config().map_err(|e| e.to_string())?;
         let (ch, rate) = (cfg.channels() as usize, cfg.sample_rate());
-        let mut rs = Resampler::new(DENOISE_RATE, RATE);
         let mut dn = Denoiser::new(rate);
-        let mut pending: Vec<i16> = Vec::new();
+        let mut pending: Vec<i16> = Vec::with_capacity(4 * PKT);
         let mut block: Vec<f32> = Vec::new();
-        let (sh, seq) = (self.sh.clone(), self.seq.clone());
-        // send from a plain thread so the real-time callback never blocks in send_to
-        let (tx, rx) = std::sync::mpsc::sync_channel::<[u8; 5 + 2 * AUDIO_PKT]>(50);
-        let (sock, dest, sh2) = (self.sock.try_clone().map_err(|e| e.to_string())?, self.dest, self.sh.clone());
-        thread::spawn(move || {
-            for p in rx {
-                if sock.send_to(&p, dest).is_ok() {
-                    sh2.stats.tx_bytes.fetch_add(p.len() as u64, Relaxed);
-                }
-            }
-        });
+        let (sh, tx) = (self.sh.clone(), self.pcm.clone());
         let (mut muted, mut noise) = (false, false);
         let on_data = move |mono: &mut dyn Iterator<Item = f32>| {
             block.clear();
@@ -188,22 +180,17 @@ impl AudioIo {
             }
             let rms = (block.iter().map(|x| x * x).sum::<f32>() / block.len() as f32).sqrt();
             sh.mic_level.store(rms.to_bits(), Relaxed);
-            // muted: send nothing (and keep seq), so the peer hears silence and counts no loss
+            // muted: send nothing (no RTP seq used), so the peer hears silence and counts no loss
             if muted || (sh.offline && !sh.loopback.load(Relaxed)) {
                 pending.clear();
                 return;
             }
-            for &x in block {
-                rs.push(x, |v| pending.push((v.clamp(-1.0, 1.0) * 32767.0) as i16));
-            }
-            while pending.len() >= AUDIO_PKT {
-                let mut p = [0u8; 5 + 2 * AUDIO_PKT]; // on the stack: no allocation in the real-time callback
-                p[0] = AUDIO;
-                p[1..5].copy_from_slice(&seq.fetch_add(1, Relaxed).to_be_bytes());
-                for (d, x) in p[5..].chunks_exact_mut(2).zip(pending.drain(..AUDIO_PKT)) {
-                    d.copy_from_slice(&x.to_le_bytes());
-                }
-                let _ = tx.try_send(p);
+            pending.extend(block.iter().map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16));
+            while pending.len() >= PKT {
+                let mut p = [0i16; PKT]; // on the stack: no allocation in the real-time callback
+                p.copy_from_slice(&pending[..PKT]);
+                pending.drain(..PKT);
+                let _ = tx.try_send(p); // Opus encoding happens on the receiving thread
             }
         };
         fn build<T: SizedSample>(
@@ -279,6 +266,8 @@ impl AudioIo {
                         fr.fill(T::from_sample((x * vol).clamp(-1.0, 1.0)));
                     }
                     sh.tone.fetch_sub(start - tone, Relaxed); // not store: the TUI may have restarted the tone meanwhile
+                    // here, not in Player::push: it must fall to 0 when the peer stops sending
+                    sh.stats.buffer_ms.store((q.len() as u64 * 1000 / rate as u64) as u32, Relaxed);
                 },
                 err,
                 None,
@@ -308,6 +297,143 @@ impl AudioIo {
             if alive.load(Relaxed) {
                 sh.log(format!("{what} error: {e}"));
             }
+        }
+    }
+}
+
+/// Received (or looped-back) 48 kHz audio into the speaker's jitter queue and the visualizer tap.
+pub struct Player {
+    sh: Arc<Shared>,
+    jitter: Jitter,
+    tap: Tap,
+    out_rate: u32,
+    rs: Resampler,
+    tap_rs: Resampler,
+    max_buf: usize,
+    tap_buf: Vec<f32>,
+    low: usize, // least queued before a push in this window
+    pushes: u32,
+}
+
+impl Player {
+    pub fn new(sh: Arc<Shared>, jitter: Jitter, tap: Tap) -> Self {
+        let tap_rs = Resampler::new(RATE, viz::RATE);
+        Player { sh, jitter, tap, out_rate: 0, rs: Resampler::new(RATE, RATE), tap_rs, max_buf: 0, tap_buf: Vec::new(), low: usize::MAX, pushes: 0 }
+    }
+
+    pub fn push(&mut self, pcm: &[i16]) {
+        let samples = pcm.iter().map(|&s| s as f32 / 32768.0);
+        {
+            // never hold jitter and tap together: the speaker callback must not wait on the visualizer
+            let mut q = self.jitter.lock().unwrap();
+            let r = self.sh.out_rate.load(Relaxed);
+            if r != self.out_rate {
+                // speaker switched to a device with another rate: queued samples are at the old rate
+                (self.out_rate, self.rs, self.max_buf) = (r, Resampler::new(RATE, r), r as usize / 8); // cap latency ~125 ms
+                q.clear();
+            }
+            // drift control: audio the queue never needed during the last second is extra latency
+            // (after a burst, or a sender clock running fast), so play it out 1% faster until it is gone
+            self.low = self.low.min(q.len());
+            self.pushes += 1;
+            if self.pushes == 50 {
+                let fast = self.low > self.out_rate as usize / 25; // 40 ms
+                self.rs.step = RATE as f64 / self.out_rate as f64 * if fast { 1.01 } else { 1.0 };
+                (self.low, self.pushes) = (usize::MAX, 0);
+            }
+            samples.clone().for_each(|x| self.rs.push(x, |v| q.push_back(v)));
+            let excess = q.len().saturating_sub(self.max_buf);
+            q.drain(..excess); // last resort; the drift control above normally keeps well below
+        }
+        let buf = &mut self.tap_buf;
+        buf.clear();
+        samples.for_each(|x| self.tap_rs.push(x, |v| buf.push(v)));
+        let mut t = self.tap.lock().unwrap();
+        t.0.extend(buf.iter());
+        let excess = t.0.len().saturating_sub(FFT_N);
+        t.0.drain(..excess);
+        t.1 = Some(Instant::now());
+    }
+}
+
+/// Opus encoder: 48 kHz mono VOIP, 32 kbit/s, in-band FEC for the peer's loss concealment.
+pub struct OpusEnc(*mut unsafe_opus::OpusEncoder);
+// SAFETY: the encoder state is plain heap memory owned by this value, used from one thread at a time.
+unsafe impl Send for OpusEnc {}
+
+impl OpusEnc {
+    pub fn new() -> Result<Self, String> {
+        let mut err = 0;
+        // SAFETY: valid arguments; the result is checked and owned by Self (freed in Drop).
+        unsafe {
+            let e = unsafe_opus::opus_encoder_create(RATE as i32, 1, unsafe_opus::OPUS_APPLICATION_VOIP, &mut err);
+            if err != unsafe_opus::OPUS_OK || e.is_null() {
+                return Err(format!("opus encoder error {err}"));
+            }
+            unsafe_opus::opus_encoder_ctl!(e, unsafe_opus::OPUS_SET_BITRATE_REQUEST, 32_000);
+            unsafe_opus::opus_encoder_ctl!(e, unsafe_opus::OPUS_SET_INBAND_FEC_REQUEST, 1);
+            unsafe_opus::opus_encoder_ctl!(e, unsafe_opus::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10);
+            Ok(OpusEnc(e))
+        }
+    }
+
+    /// One 20 ms frame into `out`; returns the packet length (None on an encoder error).
+    pub fn encode(&mut self, pcm: &Pcm, out: &mut [u8]) -> Option<usize> {
+        // SAFETY: pcm holds PKT samples, out.len() bytes are writable.
+        let n = unsafe { unsafe_opus::opus_encode(self.0, pcm.as_ptr(), PKT as i32, out.as_mut_ptr(), out.len() as i32) };
+        usize::try_from(n).ok().filter(|&n| n > 0)
+    }
+}
+
+impl Drop for OpusEnc {
+    fn drop(&mut self) {
+        // SAFETY: created by opus_encoder_create, freed once
+        unsafe { unsafe_opus::opus_encoder_destroy(self.0) }
+    }
+}
+
+pub struct OpusDec(*mut unsafe_opus::OpusDecoder);
+// SAFETY: as for OpusEnc
+unsafe impl Send for OpusDec {}
+
+impl OpusDec {
+    pub fn new() -> Result<Self, String> {
+        let mut err = 0;
+        // SAFETY: valid arguments; the result is checked and owned by Self (freed in Drop).
+        let d = unsafe { unsafe_opus::opus_decoder_create(RATE as i32, 1, &mut err) };
+        if err != unsafe_opus::OPUS_OK || d.is_null() {
+            return Err(format!("opus decoder error {err}"));
+        }
+        Ok(OpusDec(d))
+    }
+
+    /// Decodes `pkt` into one 20 ms frame. `fec` recovers the frame *before* `pkt` from its
+    /// in-band FEC; `pkt = None` conceals a lost frame (PLC). A bad packet yields silence.
+    pub fn decode(&mut self, pkt: Option<&[u8]>, fec: bool, out: &mut Pcm) {
+        let (p, len) = pkt.map_or((std::ptr::null(), 0), |p| (p.as_ptr(), p.len() as i32));
+        // SAFETY: p/len describe a live slice (or null/0 for PLC); out holds PKT samples.
+        let n = unsafe { unsafe_opus::opus_decode(self.0, p, len, out.as_mut_ptr(), PKT as i32, fec as i32) };
+        if n != PKT as i32 {
+            out.fill(0);
+        }
+    }
+}
+
+impl Drop for OpusDec {
+    fn drop(&mut self) {
+        // SAFETY: created by opus_decoder_create, freed once
+        unsafe { unsafe_opus::opus_decoder_destroy(self.0) }
+    }
+}
+
+/// `v2v config` "hear yourself": the mic through Opus straight to the speaker, as the peer would hear it.
+pub fn loopback(rx: Receiver<Pcm>, mut player: Player) {
+    let (Ok(mut enc), Ok(mut dec)) = (OpusEnc::new(), OpusDec::new()) else { return };
+    let (mut pkt, mut pcm) = ([0u8; 1500], [0i16; PKT]);
+    for p in rx {
+        if let Some(n) = enc.encode(&p, &mut pkt) {
+            dec.decode(Some(&pkt[..n]), false, &mut pcm);
+            player.push(&pcm);
         }
     }
 }
@@ -348,11 +474,31 @@ mod tests {
     #[test]
     fn resampler_rate() {
         let mut n = 0;
-        let mut r = Resampler::new(48_000, RATE);
+        let mut r = Resampler::new(48_000, 16_000);
         for _ in 0..48_000 {
             r.push(0.5, |_| n += 1);
         }
         assert!((15_990..=16_010).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn player_drains_excess_latency() {
+        let sh = Arc::new(Shared::new(crate::config::Settings::default(), false));
+        let jitter: Jitter = Arc::default();
+        let mut p = Player::new(sh, jitter.clone(), Arc::default());
+        let ms = |n: usize| n * 1000 / RATE as usize;
+        for _ in 0..5 {
+            p.push(&[0; PKT]); // a burst leaves 100 ms queued
+        }
+        // the speaker takes exactly what arrives: without drift control the queue would stay at 100 ms
+        for _ in 0..500 {
+            p.push(&[0; PKT]);
+            let mut q = jitter.lock().unwrap();
+            let n = PKT.min(q.len());
+            q.drain(..n);
+        }
+        let left = ms(jitter.lock().unwrap().len());
+        assert!((28..=42).contains(&left), "{left} ms queued"); // 40 ms target, minus up to one window of 1% speed-up
     }
 
     fn white_noise(n: usize) -> Vec<f32> {
@@ -392,6 +538,32 @@ mod tests {
         assert!(ratio < 0.1, "white noise only {ratio} quieter");
         // toggling mid-stream keeps the sample count
         assert_eq!(run(&input, |i| i % 7 < 3).len(), on.len());
+    }
+
+    #[test]
+    fn opus_fec_and_plc() {
+        let (mut enc, mut dec) = (OpusEnc::new().unwrap(), OpusDec::new().unwrap());
+        let tone = |k: usize| -> Pcm { std::array::from_fn(|i| (((k * PKT + i) as f32 * 0.0577).sin() * 8000.0) as i16) };
+        let pkts: Vec<Vec<u8>> = (0..20)
+            .map(|k| {
+                let mut b = [0u8; 1500];
+                let n = enc.encode(&tone(k), &mut b).unwrap();
+                b[..n].to_vec()
+            })
+            .collect();
+        assert!(pkts.iter().all(|p| p.len() < 200), "~32 kbit/s");
+        let energy = |p: &Pcm| p.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+        let mut out = [0i16; PKT];
+        for p in &pkts[..10] {
+            dec.decode(Some(p), false, &mut out);
+        }
+        // packet 10 lost: recovered from packet 11's FEC, then 11 itself; packet 13 lost: PLC
+        dec.decode(Some(&pkts[11]), true, &mut out);
+        assert!(energy(&out) > energy(&tone(10)) * 0.1, "FEC frame has signal");
+        dec.decode(Some(&pkts[11]), false, &mut out);
+        dec.decode(None, false, &mut out);
+        assert!(energy(&out) > 0.0, "PLC continues the signal");
+        dec.decode(Some(&[0xff; 3]), false, &mut out); // garbage never panics
     }
 
     #[test]
