@@ -1,0 +1,11 @@
+[package]
+name = "v2v"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+if-addrs = "0.15.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+minifb = "0.29.0"
+nokhwa = { version = "0.10.11", features = ["input-native"] }
