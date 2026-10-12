@@ -34,7 +34,7 @@ becomes the call menu.
 | `v2v <ip>` | video call: each side runs `v2v` with the other's IP, and the call connects when both are running |
 | `v2v` | answer the first caller instead (only needed if NAT rewrites the caller's address) |
 | `v2v --audio [<ip>]` | audio only, with a spectrum of the other side's voice in the terminal |
-| `v2v --tplay [<ip>]` | video as ASCII art in the terminal via [tplay](https://github.com/maxcurzi/tplay) |
+| `v2v --tplay [<ip>]` | video as ASCII art in the terminal via [tplay](https://github.com/maxcurzi/tplay) (Linux only) |
 | `v2v config` | the same menu without calling, with a camera preview, to test devices |
 | `v2v -h` | help, including the exact command the other side should run for each of your addresses |
 
@@ -52,6 +52,16 @@ Background blur uses MediaPipe selfie segmentation run with [tract](https://gith
 suppression uses RNNoise ([nnnoiseless](https://github.com/jneem/nnnoiseless)).
 
 Linux build deps: `libpipewire-0.3-dev`, `libasound2-dev`, `clang`/`libclang-dev`, X11 dev libs.
+Windows and macOS need a C/C++ compiler for the bundled codecs. Cross-compiling from Linux works with
+[zig](https://ziglang.org) 0.17 and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) from git
+(0.23.4 drops the `-exported_symbols_list` operand; zig 0.15's linker crashes on the macOS link):
+
+```sh
+rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin
+cargo zigbuild --target x86_64-pc-windows-gnu
+# -fcommon: minifb defines g_metal_device in two Objective-C files, which upstream clang rejects
+SDKROOT=/path/to/MacOSX.sdk CFLAGS_aarch64_apple_darwin=-fcommon cargo zigbuild --target aarch64-apple-darwin
+```
 
 ## License
 

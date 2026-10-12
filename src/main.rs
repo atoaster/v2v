@@ -3,7 +3,15 @@ mod blur;
 mod config;
 mod rtc;
 mod signal;
+#[cfg(target_os = "linux")]
 mod tplay;
+#[cfg(not(target_os = "linux"))]
+mod tplay {
+    // the watcher-uid check reads /proc/net/tcp, which only Linux has
+    pub fn run_tplay(_: crate::video::Frame, _: std::net::IpAddr, _: &std::sync::atomic::AtomicBool) -> Result<i32, String> {
+        Err("--tplay only works on Linux".into())
+    }
+}
 mod tui;
 mod video;
 mod viz;

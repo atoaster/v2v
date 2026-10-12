@@ -195,6 +195,17 @@ pub fn cameras() -> Vec<(String, String)> {
 
 /// Skips V4L2 metadata nodes (sysfs index != 0): they fail to open and would make the list confusing.
 fn usable_cameras() -> Vec<nokhwa::utils::CameraInfo> {
+    // macOS lists no cameras until the user has granted access: ask once and wait for the answer (no-op elsewhere)
+    static ACCESS: std::sync::Once = std::sync::Once::new();
+    ACCESS.call_once(|| {
+        if !nokhwa::nokhwa_check() {
+            let (tx, rx) = channel();
+            nokhwa::nokhwa_initialize(move |_| {
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(Duration::from_secs(60));
+        }
+    });
     let mut list = nokhwa::query(nokhwa::utils::ApiBackend::Auto).unwrap_or_default();
     list.retain(|c| match c.index() {
         CameraIndex::Index(n) => std::fs::read_to_string(format!("/sys/class/video4linux/video{n}/index")).map_or(true, |s| s.trim() == "0"),

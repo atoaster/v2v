@@ -1,4 +1,5 @@
-//! Persisted settings: a tiny `key=value` file at $XDG_CONFIG_HOME/v2v/config (or ~/.config/v2v/config).
+//! Persisted settings: a tiny `key=value` file at $XDG_CONFIG_HOME/v2v/config (or ~/.config/v2v/config;
+//! Windows: %USERPROFILE%\.config\v2v\config).
 
 use std::path::PathBuf;
 
@@ -89,7 +90,7 @@ pub fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("v2v").join("config"))
 }
 
