@@ -128,8 +128,7 @@ fn help(color: bool) -> String {
         config::path().map_or("$XDG_CONFIG_HOME/v2v/config".into(), |p| p.display().to_string()),
         head("The other side responds with one of:"),
     );
-    let ifs = if_addrs::get_if_addrs().unwrap_or_default();
-    for i in ifs.iter().filter(|i| i.ip().is_ipv4() && !i.is_loopback() && !i.is_link_local()) {
+    for i in callable() {
         s += &format!("  v2v {} {}\n", cmd(&format!("{:<15}", i.ip())), dim(&format!("# {}", i.name)));
     }
     s + &format!(
@@ -260,10 +259,17 @@ fn main() {
     }
 }
 
+/// The interfaces a peer can call us on (IPv4, not loopback or link-local).
+fn callable() -> Vec<if_addrs::Interface> {
+    let ifs = if_addrs::get_if_addrs().unwrap_or_default();
+    ifs.into_iter().filter(|i| i.ip().is_ipv4() && !i.is_loopback() && !i.is_link_local()).collect()
+}
+
 /// Waits for the caller's first signalling packet and returns where it came from; replying there gets through NAT.
 /// `nonce` is the one the call will start with, so a HELLO sent from here is not a stale nonce later.
 fn answer(sock: &UdpSocket, nonce: u64) -> SocketAddr {
-    eprintln!("v2v: waiting for a call on UDP port {PORT} (Ctrl-C to cancel)...");
+    let on: String = callable().iter().map(|i| format!("{} ({}), ", i.ip(), i.name)).collect();
+    eprintln!("v2v: awaiting a call on {on}UDP port {PORT} (Ctrl-C to cancel)...");
     let mut buf = [0u8; 2048];
     let (hello, mut last) = (signal::hello(nonce), None::<Instant>);
     loop {
